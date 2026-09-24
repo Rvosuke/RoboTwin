@@ -106,6 +106,7 @@ class Base_Task(gym.Env):
         self.cluttered_objs = list()
         self.prohibited_area = list()  # [x_min, y_min, x_max, y_max]
         self.record_cluttered_objects = list()  # record cluttered objects info
+        self.rotation_invariant_actors = []
 
         self.eval_success = False
         self.table_z_bias = (np.random.uniform(low=-self.random_table_height, high=0) + table_height_bias)  # TODO
@@ -176,6 +177,8 @@ class Base_Task(gym.Env):
                     actors_pose_list[idx].append(actor.get_pose())
 
             for idx, actor in enumerate(actors_list):
+                if actor in self.rotation_invariant_actors:
+                    continue
                 final_pose = actors_pose_list[idx][-1]
                 for pose in actors_pose_list[idx][-200:]:
                     if get_sim(final_pose, pose) > 3.0:
@@ -274,7 +277,8 @@ class Base_Task(gym.Env):
         table_height += self.table_z_bias
 
         if self.random_background:
-            texture_type = "seen" if not self.eval_mode else "unseen"
+            replay_seed_scene = os.environ.get("ROBOTWIN_SEED_LIST") is not None
+            texture_type = "seen" if replay_seed_scene or not self.eval_mode else "unseen"
             directory_path = f"./assets/background_texture/{texture_type}"
             file_count = len(
                 [name for name in os.listdir(directory_path) if os.path.isfile(os.path.join(directory_path, name))])
@@ -1476,9 +1480,12 @@ class Base_Task(gym.Env):
 
         return True  # TODO: maybe need try error
 
-    def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos'):  # action_type: qpos or ee
+    def take_action(self, action, action_type:Literal['qpos', 'ee']='qpos', render=True):  # action_type: qpos or ee
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
+
+        if self.eval_video_path is not None:
+            render = True
 
         eval_video_freq = 1  # fixed
         if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
@@ -1487,9 +1494,10 @@ class Base_Task(gym.Env):
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
 
-        self._update_render()
-        if self.render_freq:
-            self.viewer.render()
+        if render:
+            self._update_render()
+            if self.render_freq:
+                self.viewer.render()
 
         actions = np.array([action])
         left_jointstate = self.robot.get_left_arm_jointState()
@@ -1652,18 +1660,21 @@ class Base_Task(gym.Env):
                 now_right_id += 1
 
             self.scene.step()
-            self._update_render()
-                
+            if render:
+                self._update_render()
+
             if self.check_success():
                 self.eval_success = True
-                self.get_obs() # update obs
-                if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+                if render:
+                    self.get_obs()  # update obs
+                    if self.eval_video_path is not None:
+                        self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
-        self._update_render()
-        if self.render_freq:  # UI
-            self.viewer.render()
+        if render:
+            self._update_render()
+            if self.render_freq:  # UI
+                self.viewer.render()
 
 
     def save_camera_images(self, task_name, step_name, generate_num_id, save_dir="./camera_images"):

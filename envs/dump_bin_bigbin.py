@@ -60,6 +60,7 @@ class dump_bin_bigbin(Base_Task):
                 name="garbage",
             )
             self.sphere_lst.append(sphere)
+            self.rotation_invariant_actors.append(sphere)
             self.sphere_lst[-1].find_component_by_type(sapien.physx.PhysxRigidDynamicComponent).mass = 0.0001
 
         self.add_prohibit_area(self.deskbin, padding=0.04)

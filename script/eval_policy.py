@@ -1,6 +1,8 @@
 import sys
 import os
+import json
 import subprocess
+from pathlib import Path
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -20,6 +22,45 @@ import argparse
 import pdb
 
 from generate_episode_instructions import *
+
+
+FROZEN_SEED_SETUP_ATTEMPTS = 10
+
+
+def _load_seed_list():
+    seed_path = os.environ.get("ROBOTWIN_SEED_LIST")
+    if seed_path is None:
+        return None
+    seeds = [int(token) for token in Path(seed_path).read_text().split()]
+    instruction_path = os.environ["ROBOTWIN_SEED_INSTRUCTIONS"]
+    instructions = json.loads(Path(instruction_path).read_text())
+    missing = [seed for seed in seeds if str(seed) not in instructions]
+    if missing:
+        raise ValueError(f"instruction cache is missing seeds {missing[:5]}")
+    if any(not isinstance(instructions[str(seed)], str) for seed in seeds):
+        raise ValueError("instruction cache values must be strings")
+    print(f"Loaded {len(seeds)} frozen seed/instruction pairs", flush=True)
+    return seeds, instructions
+
+
+def _setup_frozen_seed(task_env, now_id, seed, args):
+    for attempt in range(1, FROZEN_SEED_SETUP_ATTEMPTS + 1):
+        try:
+            task_env.setup_demo(now_ep_num=now_id, seed=seed, is_test=True, **args)
+            return
+        except UnStableError:
+            try:
+                task_env.close_env(clear_cache=True)
+            except Exception:
+                pass
+            if attempt == FROZEN_SEED_SETUP_ATTEMPTS:
+                raise
+            print(
+                f"Retry unstable frozen seed={seed} "
+                f"({attempt}/{FROZEN_SEED_SETUP_ATTEMPTS})",
+                flush=True,
+            )
+
 
 current_file_path = os.path.abspath(__file__)
 parent_directory = os.path.dirname(current_file_path)
@@ -61,7 +102,7 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
-def main(usr_args):
+def main(usr_args, model=None):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = usr_args["task_name"]
     task_config = usr_args["task_config"]
@@ -77,6 +118,14 @@ def main(usr_args):
 
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
+
+    if (
+        os.environ.get("ROBOTWIN_FAST_EVAL") == "1"
+        and args["render_freq"] == 0
+        and not args["domain_randomization"]["random_light"]
+    ):
+        args["eval_video_log"] = False
+        args["data_type"]["third_view"] = False
 
     args['task_name'] = task_name
     args["task_config"] = task_config
@@ -162,7 +211,8 @@ def main(usr_args):
     test_num = 100
     topk = 1
 
-    model = get_model(usr_args)
+    if model is None:
+        model = get_model(usr_args)
     st_seed, suc_num = eval_policy(task_name,
                                    TASK_ENV,
                                    args,
@@ -180,10 +230,10 @@ def main(usr_args):
         file.write(f"Timestamp: {current_time}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
         # file.write(str(task_reward) + '\n')
-        file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
+        file.write("\n".join(map(str, np.array(suc_nums) / TASK_ENV.test_num)))
 
     print(f"Data has been saved to {file_path}")
-    # return task_reward
+    return model
 
 
 def eval_policy(task_name,
@@ -197,7 +247,11 @@ def eval_policy(task_name,
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = True
+    seed_list_state = _load_seed_list()
+    expert_check = seed_list_state is None
+    seed_list, seed_instructions = seed_list_state if seed_list_state else ([], {})
+    if not expert_check:
+        print("Expert planner skipped; using frozen instructions.", flush=True)
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
@@ -214,6 +268,9 @@ def eval_policy(task_name,
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
+    if seed_list:
+        now_seed = seed_list[0]
+        test_num = len(seed_list)
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]
@@ -251,12 +308,19 @@ def eval_policy(task_name,
             args["render_freq"] = render_freq
             continue
 
+        current_seed = now_seed
         args["render_freq"] = render_freq
 
-        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        if seed_list:
+            _setup_frozen_seed(TASK_ENV, now_id, now_seed, args)
+        else:
+            TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+        if seed_instructions:
+            instruction = seed_instructions[str(now_seed)]
+        else:
+            episode_info_list = [episode_info["info"]]
+            results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+            instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:
@@ -296,6 +360,11 @@ def eval_policy(task_name,
             if TASK_ENV.eval_success:
                 succ = True
                 break
+        print(
+            f"WLA_RESULT seed={current_seed} result={'Success' if succ else 'Fail'} "
+            f"actions={TASK_ENV.take_action_cnt}",
+            flush=True,
+        )
         # task_total_reward += TASK_ENV.episode_score
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
@@ -307,7 +376,12 @@ def eval_policy(task_name,
             print("\033[91mFail!\033[0m")
 
         now_id += 1
-        TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
+        TASK_ENV.close_env(
+            clear_cache=(
+                (succ_seed + 1) % clear_cache_freq == 0
+                or succ_seed >= test_num
+            )
+        )
 
         if TASK_ENV.render_freq:
             TASK_ENV.viewer.close()
@@ -319,7 +393,12 @@ def eval_policy(task_name,
             f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
         )
         # TASK_ENV._take_picture()
-        now_seed += 1
+        if seed_list:
+            if succ_seed >= len(seed_list):
+                break
+            now_seed = seed_list[succ_seed]
+        else:
+            now_seed += 1
 
     return now_seed, TASK_ENV.suc
 
