@@ -75,7 +75,7 @@ def get_embodiment_config(robot_file):
     return embodiment_args
 
 
-def main(task_name=None, task_config=None):
+def main(task_name, task_config, seed_start, seed_count):
 
     task = class_decorator(task_name)
     config_path = os.path.join(CONFIGS_PATH, f"{task_config}.yml")
@@ -84,6 +84,8 @@ def main(task_name=None, task_config=None):
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
     args['task_name'] = task_name
+    args["seed_start"] = seed_start
+    args["seed_count"] = seed_count
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
@@ -151,7 +153,7 @@ def main(task_name=None, task_config=None):
 
 
 def run(TASK_ENV, args):
-    epid, suc_num, fail_num, seed_list = 0, 0, 0, []
+    epid, suc_num, fail_num, seed_list = args["seed_start"], 0, 0, []
 
     print(f"Task Name: \033[34m{args['task_name']}\033[0m")
 
@@ -172,6 +174,8 @@ def run(TASK_ENV, args):
             print(f"Exist seed file, Start from: {epid} / {suc_num}")
 
         while suc_num < args["episode_num"]:
+            if args["seed_count"] is not None and epid >= args["seed_start"] + args["seed_count"]:
+                raise RuntimeError(f"Candidate seeds exhausted after {suc_num} successful plans")
             try:
                 TASK_ENV.setup_demo(now_ep_num=suc_num, seed=epid, **args)
                 TASK_ENV.play_once()
@@ -227,7 +231,8 @@ def run(TASK_ENV, args):
                 for sed in seed_list:
                     file.write("%s " % sed)
 
-        print(f"\nComplete simulation, failed \033[91m{fail_num}\033[0m times / {epid} tries \n")
+        attempts = epid - args["seed_start"]
+        print(f"\nComplete simulation, failed \033[91m{fail_num}\033[0m times / {attempts} tries \n")
     else:
         print("\033[93m" + "Use Saved Seeds List".center(30, "-") + "\033[0m")
         with open(os.path.join(args["save_path"], "seed.txt"), "r") as file:
@@ -302,8 +307,10 @@ if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("task_name", type=str)
     parser.add_argument("task_config", type=str)
+    parser.add_argument("--seed-start", type=int, default=0)
+    parser.add_argument("--seed-count", type=int, default=None)
     parser = parser.parse_args()
     task_name = parser.task_name
     task_config = parser.task_config
 
-    main(task_name=task_name, task_config=task_config)
+    main(task_name, task_config, parser.seed_start, parser.seed_count)

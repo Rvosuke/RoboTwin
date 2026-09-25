@@ -86,84 +86,91 @@ def create_xpolicylab_hdf5(data, hdf5_path, instructions, frequency):
     if not instruction_values:
         instruction_values = [""]
 
-    with h5py.File(hdf5_path, "w") as f:
-        string_dtype = h5py.string_dtype(encoding="utf-8")
-        f.attrs["source_format"] = "RoboTwin"
-        f.attrs["source_path"] = "native_collection"
-        f.create_dataset("data_format_version", data="v1.0", dtype=string_dtype)
-        f.create_dataset(
-            "instructions",
-            data=json.dumps(instruction_values, ensure_ascii=False),
-            dtype=string_dtype,
-        )
-        f.create_group("additional_info").create_dataset(
-            "frequency", data=np.asarray(frequency, dtype=np.int32)
-        )
-
-        state = f.create_group("state")
-        action = f.create_group("action")
-        joint_fields = [
-            ("left_arm", "left_arm_joint_states"),
-            ("left_gripper", "left_ee_joint_states"),
-            ("right_arm", "right_arm_joint_states"),
-            ("right_gripper", "right_ee_joint_states"),
-        ]
-        for source_name, target_name in joint_fields:
-            if source_name not in joints:
-                continue
-            values = _ensure_2d(joints[source_name])
-            state.create_dataset(target_name, data=values[:-1])
-            action.create_dataset(target_name, data=values[1:])
-
-        endpose = data.get("endpose", {})
-        for source_name, target_name in [
-            ("left_endpose", "left_ee_poses"),
-            ("right_endpose", "right_ee_poses"),
-        ]:
-            if source_name not in endpose:
-                continue
-            values = _ensure_2d(endpose[source_name])
-            state.create_dataset(target_name, data=values[:-1])
-            action.create_dataset(target_name, data=values[1:])
-
-        vision = f.create_group("vision")
-        observations = data["observation"]
-        for source_name, target_name in CAMERA_MAP.items():
-            if source_name not in observations or "rgb" not in observations[source_name]:
-                continue
-            source_camera = observations[source_name]
-            target_camera = vision.create_group(target_name)
-            colors = np.asarray(source_camera["rgb"])[:-1]
-            encoded_colors, max_len = images_encoding(colors)
-            target_camera.create_dataset(
-                "colors", data=encoded_colors, dtype=f"S{max_len}"
+    hdf5_path = Path(hdf5_path)
+    temporary_path = hdf5_path.with_suffix(hdf5_path.suffix + ".tmp")
+    temporary_path.unlink(missing_ok=True)
+    try:
+        with h5py.File(temporary_path, "w") as f:
+            string_dtype = h5py.string_dtype(encoding="utf-8")
+            f.attrs["source_format"] = "RoboTwin"
+            f.attrs["source_path"] = "native_collection"
+            f.create_dataset("data_format_version", data="v1.0", dtype=string_dtype)
+            f.create_dataset(
+                "instructions",
+                data=json.dumps(instruction_values, ensure_ascii=False),
+                dtype=string_dtype,
             )
-            target_camera.create_dataset(
-                "shape", data=np.asarray(colors[0].shape, dtype=np.int32)
+            f.create_group("additional_info").create_dataset(
+                "frequency", data=np.asarray(frequency, dtype=np.int32)
             )
 
-            if "depth" in source_camera:
+            state = f.create_group("state")
+            action = f.create_group("action")
+            joint_fields = [
+                ("left_arm", "left_arm_joint_states"),
+                ("left_gripper", "left_ee_joint_states"),
+                ("right_arm", "right_arm_joint_states"),
+                ("right_gripper", "right_ee_joint_states"),
+            ]
+            for source_name, target_name in joint_fields:
+                if source_name not in joints:
+                    continue
+                values = _ensure_2d(joints[source_name])
+                state.create_dataset(target_name, data=values[:-1])
+                action.create_dataset(target_name, data=values[1:])
+
+            endpose = data.get("endpose", {})
+            for source_name, target_name in [
+                ("left_endpose", "left_ee_poses"),
+                ("right_endpose", "right_ee_poses"),
+            ]:
+                if source_name not in endpose:
+                    continue
+                values = _ensure_2d(endpose[source_name])
+                state.create_dataset(target_name, data=values[:-1])
+                action.create_dataset(target_name, data=values[1:])
+
+            vision = f.create_group("vision")
+            observations = data["observation"]
+            for source_name, target_name in CAMERA_MAP.items():
+                if source_name not in observations or "rgb" not in observations[source_name]:
+                    continue
+                source_camera = observations[source_name]
+                target_camera = vision.create_group(target_name)
+                colors = np.asarray(source_camera["rgb"])[:-1]
+                encoded_colors, max_len = images_encoding(colors)
                 target_camera.create_dataset(
-                    "depths", data=np.asarray(source_camera["depth"])[:-1]
+                    "colors", data=encoded_colors, dtype=f"S{max_len}"
+                )
+                target_camera.create_dataset(
+                    "shape", data=np.asarray(colors[0].shape, dtype=np.int32)
                 )
 
-            intrinsic = source_camera.get(
-                "intrinsic_cv", source_camera.get("intrinsic_matrix")
-            )
-            if intrinsic is not None:
-                target_camera.create_dataset(
-                    "intrinsic_matrix", data=np.asarray(intrinsic)[:-1]
-                )
+                if "depth" in source_camera:
+                    target_camera.create_dataset(
+                        "depths", data=np.asarray(source_camera["depth"])[:-1]
+                    )
 
-            extrinsic = source_camera.get("cam2world_gl")
-            if extrinsic is None:
-                extrinsic = source_camera.get("extrinsic_cv")
-            if extrinsic is None:
-                extrinsic = source_camera.get("extrinsics_matrix")
-            if extrinsic is not None:
-                target_camera.create_dataset(
-                    "extrinsics_matrix", data=_to_4x4(extrinsic)[:-1]
+                intrinsic = source_camera.get(
+                    "intrinsic_cv", source_camera.get("intrinsic_matrix")
                 )
+                if intrinsic is not None:
+                    target_camera.create_dataset(
+                        "intrinsic_matrix", data=np.asarray(intrinsic)[:-1]
+                    )
+
+                extrinsic = source_camera.get("cam2world_gl")
+                if extrinsic is None:
+                    extrinsic = source_camera.get("extrinsic_cv")
+                if extrinsic is None:
+                    extrinsic = source_camera.get("extrinsics_matrix")
+                if extrinsic is not None:
+                    target_camera.create_dataset(
+                        "extrinsics_matrix", data=_to_4x4(extrinsic)[:-1]
+                    )
+        os.replace(temporary_path, hdf5_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
     return frame_num - 1
 

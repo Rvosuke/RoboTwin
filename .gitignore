@@ -9,8 +9,10 @@ envs/curobo
 *.zip
 viewer_show.*
 eval_video/
-# WLA run configs are staged here; upstream configs are tracked under env_cfg/.
+# WLA configs are owned by the parent repository and staged at launch.
 /task_config/
+/env_cfg/task_config/ttt_clean.yml
+/env_cfg/task_config/ttt_randomized.yml
 **/.DS_Store
 *.bac
 doc/

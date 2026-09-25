@@ -32,6 +32,7 @@ for path in (ROBOTWIN_ROOT, ROBOTWIN_ROOT / "scripts", ROBOTWIN_ROOT / "descript
 from envs import CONFIGS_PATH
 from envs.utils.create_actor import UnStableError
 from generate_episode_instructions import generate_episode_descriptions
+from eval_contract import EpisodeJournal, capture_policy_rng, load_frozen_episodes, use_fast_render
 
 
 CAMERA_NAME_MAP = {
@@ -171,6 +172,14 @@ def load_task_args(usr_args: dict[str, Any]) -> tuple[dict[str, Any], str]:
     with open(TASK_CONFIG_ROOT / f"{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.safe_load(f)
 
+    if (
+        os.environ.get("ROBOTWIN_FAST_EVAL") == "1"
+        and args["render_freq"] == 0
+        and not args["domain_randomization"]["random_light"]
+    ):
+        args["eval_video_log"] = False
+        args["data_type"]["third_view"] = False
+
     args["task_name"] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
@@ -267,7 +276,7 @@ def print_config(args: dict[str, Any], embodiment_name: str) -> None:
     print("\n==================================")
 
 
-def main(usr_args: dict[str, Any]) -> None:
+def main(usr_args: dict[str, Any], model_client=None) -> None:
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     task_name = usr_args["task_name"]
     task_config = usr_args.get("task_config", "demo_clean")
@@ -304,9 +313,12 @@ def main(usr_args: dict[str, Any]) -> None:
 
     seed = int(usr_args["seed"])
     st_seed = 100000 * (1 + seed)
-    test_num = int(usr_args.get("test_num", 100))
+    frozen = load_frozen_episodes()
+    test_num = len(frozen[0]) if frozen else int(usr_args.get("test_num") or 100)
 
-    model_client = build_policy_client(usr_args)
+    owns_client = model_client is None
+    if owns_client:
+        model_client = build_policy_client(usr_args)
     try:
         _, suc_num = eval_remote_policy(
             task_name,
@@ -320,7 +332,8 @@ def main(usr_args: dict[str, Any]) -> None:
             instruction_type=instruction_type,
         )
     finally:
-        close_policy_client(model_client)
+        if owns_client:
+            close_policy_client(model_client)
 
     file_path = os.path.join(save_dir, "_result.txt")
     with open(file_path, "w", encoding="utf-8") as file:
@@ -333,6 +346,8 @@ def main(usr_args: dict[str, Any]) -> None:
 
 
 def main_batch(usr_args: dict[str, Any]) -> None:
+    if load_frozen_episodes() is not None:
+        raise ValueError("Frozen episodes require one sequential client per policy server")
     current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
     task_name = usr_args["task_name"]
     task_config = usr_args.get("task_config", "demo_clean")
@@ -769,6 +784,24 @@ def safe_close_env(task_env, clear_cache: bool = False) -> None:
         pass
 
 
+FROZEN_SEED_SETUP_ATTEMPTS = 10
+
+
+def _setup_frozen_seed(task_env, now_id, seed, args):
+    for attempt in range(1, FROZEN_SEED_SETUP_ATTEMPTS + 1):
+        try:
+            task_env.setup_demo(now_ep_num=now_id, seed=seed, is_test=True, **args)
+            return
+        except UnStableError:
+            try:
+                task_env.close_env(clear_cache=True)
+            except Exception:
+                pass
+            if attempt == FROZEN_SEED_SETUP_ATTEMPTS:
+                raise
+            print(f"Retry unstable frozen seed={seed} ({attempt}/{FROZEN_SEED_SETUP_ATTEMPTS})", flush=True)
+
+
 def eval_remote_policy(
     task_name: str,
     task_env,
@@ -784,21 +817,47 @@ def eval_remote_policy(
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = parse_bool(usr_args.get("expert_check", True))
+    frozen = load_frozen_episodes()
+    seed_list, seed_instructions = frozen if frozen else ([], {})
+    journal = None
+    if usr_args.get("episode_results"):
+        if not frozen:
+            raise ValueError("Episode resume requires frozen seed/instruction pairs")
+        journal = EpisodeJournal(
+            usr_args["episode_results"], usr_args["resume_identity"],
+            seed_list, seed_instructions,
+        )
+    expert_check = frozen is None and parse_bool(usr_args.get("expert_check", True))
     frequency = int(usr_args.get("frequency", usr_args.get("ctrl_freq", 30)))
     action_type = str(usr_args.get("action_type", "joint"))
+    history_obs_step = None
+    if usr_args.get("sparse_observations"):
+        history_obs_step = int(model_client.call(func_name="get_observation_config")["history_obs_step"])
 
     task_env.suc = 0
     task_env.test_num = 0
 
     now_id = 0
     succ_seed = 0
-    now_seed = st_seed
+    now_seed = seed_list[0] if frozen else st_seed
+    if frozen:
+        test_num = len(seed_list)
     clear_cache_freq = args["clear_cache_freq"]
     args["eval_mode"] = True
     consecutive_env_errors = 0
 
     while succ_seed < test_num:
+        if journal is not None and str(now_seed) in journal.results:
+            result = journal.results[str(now_seed)]
+            print(f"WLA_RESULT seed={now_seed} result={result['result']} actions={result['actions']}", flush=True)
+            task_env.suc += int(result["result"] == "Success")
+            task_env.test_num += 1
+            now_id += 1
+            succ_seed += 1
+            if succ_seed >= test_num:
+                break
+            now_seed = seed_list[succ_seed]
+            continue
         render_freq = args["render_freq"]
         args["render_freq"] = 0
         episode_info = {"info": {}}
@@ -828,21 +887,31 @@ def eval_remote_policy(
 
         args["render_freq"] = render_freq
         try:
-            task_env.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
+            if frozen:
+                _setup_frozen_seed(task_env, now_id, now_seed, args)
+            else:
+                task_env.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
         except UnStableError:
             safe_close_env(task_env)
+            if frozen:
+                raise
             print(f"skip unstable seed={now_seed} (eval setup)")
             now_seed += 1
             continue
         except Exception as e:
             safe_close_env(task_env)
+            if frozen:
+                raise
             print(f"skip seed={now_seed} setup error: {type(e).__name__}: {e}")
             now_seed += 1
             continue
 
         succ_seed += 1
 
-        instruction = build_instruction(args, episode_info, instruction_type, test_num, now_seed)
+        instruction = (
+            seed_instructions[str(now_seed)] if frozen
+            else build_instruction(args, episode_info, instruction_type, test_num, now_seed)
+        )
         task_env.set_instruction(instruction=instruction)
 
         if task_env.eval_video_path is not None:
@@ -877,8 +946,12 @@ def eval_remote_policy(
         succ = False
         rollout_steps = 0
         rollout_failed = False
-        prepare_policy_case(model_client, task_name, now_seed, instruction, action_type)
+        prepare_policy_case(
+            model_client, task_name, now_seed, instruction, action_type,
+            transfer_rng=bool(usr_args.get("policy_rng_transfer")),
+        )
         reset_policy(model_client)
+        fast_render = use_fast_render(task_env)
         try:
             while not is_episode_end(task_env):
                 observation = task_env.get_obs()
@@ -893,6 +966,10 @@ def eval_remote_policy(
                 action_chunk = normalize_action_chunk(model_client.call(func_name="get_action"))
                 if len(action_chunk) == 0:
                     raise RuntimeError("Policy returned an empty action chunk.")
+                history_index = (
+                    max(len(action_chunk) - history_obs_step - 1, 0)
+                    if history_obs_step is not None else None
+                )
 
                 for action_idx, action in enumerate(action_chunk):
                     flat_action, robotwin_action_type = xpolicylab_action_to_robotwin(
@@ -900,7 +977,7 @@ def eval_remote_policy(
                         action_type=action_type,
                         current_observation=observation,
                     )
-                    task_env.take_action(flat_action, action_type=robotwin_action_type)
+                    task_env.take_action(flat_action, action_type=robotwin_action_type, render=not fast_render)
                     rollout_steps += 1
 
                     if task_env.eval_success:
@@ -909,6 +986,8 @@ def eval_remote_policy(
                     if is_episode_end(task_env) or action_idx + 1 == len(action_chunk):
                         break
 
+                    if fast_render and history_index is not None and action_idx != history_index:
+                        continue
                     observation = task_env.get_obs()
                     xpl_obs = robotwin_obs_to_xpolicylab(
                         observation,
@@ -925,6 +1004,11 @@ def eval_remote_policy(
             rollout_failed = True
             print("\n\033[91mPolicy rollout error:\033[0m")
             print(traceback.format_exc())
+            if frozen:
+                if task_env.eval_video_path is not None:
+                    task_env._del_eval_video_ffmpeg()
+                safe_close_env(task_env, clear_cache=True)
+                raise
 
         if task_env.eval_video_path is not None:
             task_env._del_eval_video_ffmpeg()
@@ -957,11 +1041,17 @@ def eval_remote_policy(
             print("\033[91mFail!\033[0m")
 
         now_id += 1
-        task_env.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
+        task_env.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0 or succ_seed >= test_num))
 
         if task_env.render_freq:
             task_env.viewer.close()
 
+        if journal is not None:
+            journal.record(now_seed, succ, task_env.take_action_cnt)
+        print(
+            f"WLA_RESULT seed={now_seed} result={'Success' if succ else 'Fail'} "
+            f"actions={task_env.take_action_cnt}", flush=True,
+        )
         task_env.test_num += 1
         print(
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | "
@@ -970,7 +1060,12 @@ def eval_remote_policy(
             f"\033[95m{round(task_env.suc / task_env.test_num * 100, 1)}%\033[0m, "
             f"current seed: \033[90m{now_seed}\033[0m\n"
         )
-        now_seed += 1
+        if frozen:
+            if succ_seed >= test_num:
+                break
+            now_seed = seed_list[succ_seed]
+        else:
+            now_seed += 1
 
     return now_seed, task_env.suc
 
@@ -1003,18 +1098,21 @@ def reset_policy(model_client) -> None:
     model_client.call(func_name="reset")
 
 
-def prepare_policy_case(model_client, task_name: str, seed: int, instruction: str, action_type: str) -> None:
+def prepare_policy_case(model_client, task_name: str, seed: int, instruction: str, action_type: str, *, transfer_rng: bool = False) -> None:
     if getattr(model_client, "_robotwin_protocol", None) != "ws":
+        return
+    case_meta = {
+        "task_name": task_name, "seed": int(seed),
+        "instruction": instruction, "action_type": action_type,
+    }
+    if transfer_rng:
+        case_meta["policy_rng"] = capture_policy_rng()
+        model_client.call(func_name="prepare_case", obs=case_meta)
         return
     try:
         model_client.call(
             func_name="prepare_case",
-            obs={
-                "task_name": task_name,
-                "seed": int(seed),
-                "instruction": instruction,
-                "action_type": action_type,
-            },
+            obs=case_meta,
         )
     except Exception:
         pass
@@ -1058,7 +1156,10 @@ def robotwin_obs_to_xpolicylab(
         "env_idx": int(env_idx),
         "vision": convert_vision(observation),
         "state": convert_state(observation, task_env=task_env),
-        "additional_info": {"frequency": int(frequency)},
+        "additional_info": {
+            "frequency": int(frequency),
+            **({"action_step": int(task_env.take_action_cnt)} if task_env is not None else {}),
+        },
     }
 
 
