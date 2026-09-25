@@ -1,6 +1,7 @@
 models/
 data/*
 !data/process_stuck.py
+!data/decode_image_bit.py
 __pycache__/
 **/checkpoints/
 result/
@@ -8,8 +9,11 @@ envs/curobo
 *.zip
 viewer_show.*
 eval_video/
-task_config/
+# WLA run configs are staged here; upstream configs are tracked under env_cfg/.
+/task_config/
 **/.DS_Store
+*.bac
+doc/
 
 # eval result
 eval_result/

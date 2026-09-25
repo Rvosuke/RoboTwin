@@ -84,7 +84,7 @@ def eval_function_decorator(policy_name, model_name):
         raise e
 
 def get_camera_config(camera_type):
-    camera_config_path = os.path.join(parent_directory, "../task_config/_camera_config.yml")
+    camera_config_path = os.path.join(CONFIGS_PATH, "_camera_config.yml")
 
     assert os.path.isfile(camera_config_path), "task config file is missing"
 
@@ -116,7 +116,11 @@ def main(usr_args, model=None):
 
     get_model = eval_function_decorator(policy_name, "get_model")
 
-    with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
+    # WLA stages its run configs in task_config; upstream defaults live in env_cfg.
+    task_config_path = Path("task_config") / f"{task_config}.yml"
+    if not task_config_path.is_file():
+        task_config_path = Path(CONFIGS_PATH) / f"{task_config}.yml"
+    with open(task_config_path, "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
     if (
@@ -319,8 +323,10 @@ def eval_policy(task_name,
             instruction = seed_instructions[str(now_seed)]
         else:
             episode_info_list = [episode_info["info"]]
-            results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-            instruction = np.random.choice(results[0][instruction_type])
+            results = generate_episode_descriptions(
+                args["task_name"], episode_info_list, test_num, seed=current_seed
+            )
+            instruction = episode_rng(current_seed, 0).choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:

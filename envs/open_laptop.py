@@ -31,6 +31,7 @@ class open_laptop(Base_Task):
         face_prod = get_face_prod(self.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
         self.arm_tag = ArmTag("left" if face_prod > 0 else "right")
 
+
     def play_once(self):
         face_prod = get_face_prod(self.laptop.get_pose().q, [1, 0, 0], [1, 0, 0])
         arm_tag = ArmTag("left" if face_prod > 0 else "right")
