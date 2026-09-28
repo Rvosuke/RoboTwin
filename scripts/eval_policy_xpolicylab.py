@@ -185,6 +185,8 @@ def load_task_args(usr_args: dict[str, Any]) -> tuple[dict[str, Any], str]:
     args["ckpt_setting"] = ckpt_setting
     args["policy_name"] = usr_args["policy_name"]
     ensure_xpolicylab_observation_flags(args)
+    if "collect_depth" in usr_args:
+        args["data_type"]["depth"] = usr_args["collect_depth"]
 
     embodiment_type = args.get("embodiment")
     embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
